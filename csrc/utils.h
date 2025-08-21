@@ -179,6 +179,28 @@ namespace CUDAUtils {
     #endif
 
 #elif defined(USE_CUDA)
+    static bool should_use_virtual_memory(size_t size, CUdevice device) {
+        static size_t granularity = 0;
+        static bool initialized = false;
+
+        if (!initialized) {
+            CUmemAllocationProp prop = {};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = device;
+
+            CUresult result = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+            if (result != CUDA_SUCCESS) {
+                std::cerr << "[torch_memory_saver.cpp] cuMemGetAllocationGranularity failed: " << result << std::endl;
+                // the default value is 2MB
+                granularity = 2 * 1024 * 1024;
+            }
+            initialized = true;
+        }
+
+        return size % granularity == 0;
+    }
+
     static void cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;

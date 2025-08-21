@@ -93,6 +93,10 @@ cudaError_t TorchMemorySaver::malloc(void **ptr, CUdevice device, size_t size, c
 #endif
 
 #elif defined(USE_CUDA)
+    if (C10_UNLIKELY(!CUDAUtils::should_use_virtual_memory(size, device))) {
+        return APIForwarder::call_real_cuda_malloc(ptr, size);
+    }
+
     CUmemGenericAllocationHandle allocHandle;
     CUDAUtils::cu_mem_create(&allocHandle, size, device);
     CURESULT_CHECK(cuMemAddressReserve((CUdeviceptr *) ptr, size, 0, 0, 0));
