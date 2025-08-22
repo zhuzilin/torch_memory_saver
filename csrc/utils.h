@@ -179,7 +179,7 @@ namespace CUDAUtils {
     #endif
 
 #elif defined(USE_CUDA)
-    static bool should_use_virtual_memory(size_t size, CUdevice device) {
+    static size_t align_size(size_t size, CUdevice device) {
         static size_t granularity = 0;
         static bool initialized = false;
 
@@ -198,7 +198,7 @@ namespace CUDAUtils {
             initialized = true;
         }
 
-        return size % granularity == 0;
+        return (size + granularity - 1) / granularity * granularity;
     }
 
     static void cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
