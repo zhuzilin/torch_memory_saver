@@ -33,33 +33,57 @@ def run(hook_mode: str):
     mem_after_pause = get_and_print_gpu_memory("After pause")
     assert mem_after_pause < mem_initial + 200 * 1024 ** 2
 
-    with torch_memory_saver.disable():
-        mem_after_disable = get_and_print_gpu_memory("After disable")
-        assert mem_after_disable == mem_after_pause
+    original_mem_pool = torch.cuda.MemPool
 
-        # Can still execute code in disabled region
-        tensor_in_disabled_region = torch.full((1024 ** 3,), 53, dtype=torch.uint8, device='cuda')
-        out = tensor_in_disabled_region.float().mean().item()
-        assert out == 53, f"{out=}"
+    def reject_mem_pool(*args, **kwargs):
+        raise AssertionError("disable() must not create a MemPool")
 
-        mem_after_exec_in_disable = get_and_print_gpu_memory("After exec in disable")
-        assert mem_after_exec_in_disable > mem_after_disable + 4 * 1024 ** 3
+    torch.cuda.MemPool = reject_mem_pool
+    try:
+        with torch_memory_saver.disable():
+            mem_after_disable = get_and_print_gpu_memory("After disable")
+            assert mem_after_disable == mem_after_pause
 
-        del tensor_in_disabled_region
+            persistent_buffer = torch.full(
+                (1024 ** 2,),
+                17,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+
+            # Can still execute code in disabled region
+            tensor_in_disabled_region = torch.full((1024 ** 3,), 53, dtype=torch.uint8, device='cuda')
+            out = tensor_in_disabled_region.float().mean().item()
+            assert out == 53, f"{out=}"
+
+            mem_after_exec_in_disable = get_and_print_gpu_memory("After exec in disable")
+            assert mem_after_exec_in_disable > mem_after_disable + 4 * 1024 ** 3
+
+            del tensor_in_disabled_region
+    finally:
+        torch.cuda.MemPool = original_mem_pool
 
     # should do cleanup
     mem_after_exit_disable = get_and_print_gpu_memory("After exiting disable")
     assert mem_after_exit_disable <= mem_after_pause + 10 * 1024 ** 2
+    assert persistent_buffer[123].item() == 17
 
     torch_memory_saver.resume()
     mem_after_resume = get_and_print_gpu_memory("After resume")
-    delta_expect = mem_after_forward_pass - mem_after_pause
-    delta_actual = mem_after_resume - mem_after_exit_disable
-    assert delta_expect - 50 * 1024 ** 2 < delta_actual < delta_expect + 50 * 1024 ** 2
+    assert persistent_buffer[456].item() == 17
+    # Fully free forward-cache segments are deliberately evicted by
+    # disable()'s cleanup. Only segments that still contain live model tensors
+    # need to be restored.
+    assert mem_after_resume > mem_after_exit_disable + 512 * 1024 ** 2
+    assert mem_after_resume < mem_after_forward_pass - 4 * 1024 ** 3
 
     _execute_forward_pass_and_assert(model_weights)
     mem_after_second_forward_pass = get_and_print_gpu_memory("After second forward pass")
-    assert mem_after_resume - 1024 ** 2 < mem_after_second_forward_pass < mem_after_resume + 1024 ** 2
+    assert (
+        mem_after_forward_pass - 200 * 1024 ** 2
+        < mem_after_second_forward_pass
+        < mem_after_forward_pass + 200 * 1024 ** 2
+    )
 
     # simulate cache eviction
     # NOTE: here we assume
@@ -77,7 +101,7 @@ def run(hook_mode: str):
     assert (initial_tensor.max() == 43) and (initial_tensor.min() == 43)
     get_and_print_gpu_memory("[cache-eviction-test] after using other tensors")
 
-    del initial_tensor
+    del initial_tensor, persistent_buffer
 
 
 def _execute_forward_pass_and_assert(weights: List[torch.Tensor]):

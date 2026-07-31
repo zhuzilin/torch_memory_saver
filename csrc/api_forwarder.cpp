@@ -6,6 +6,13 @@
 namespace APIForwarder {
     using CudaMallocFunc = cudaError_t (*)(void**, size_t);
     using CudaFreeFunc = cudaError_t (*)(void*);
+#if defined(USE_CUDA)
+    using CudaGetDriverEntryPointFunc = cudaError_t (*)(
+        const char*, void**, unsigned long long, cudaDriverEntryPointQueryResult*);
+    using CudaGetDriverEntryPointByVersionFunc = cudaError_t (*)(
+        const char*, void**, unsigned int, unsigned long long,
+        cudaDriverEntryPointQueryResult*);
+#endif
 
 #if defined(USE_ROCM)
     static constexpr const char* MALLOC_NAME = "hipMalloc";
@@ -25,6 +32,10 @@ namespace APIForwarder {
 
     static CudaMallocFunc real_cuda_malloc_ = NULL;
     static CudaFreeFunc real_cuda_free_ = NULL;
+#if defined(USE_CUDA)
+    static CudaGetDriverEntryPointFunc real_cuda_get_driver_entry_point_ = NULL;
+    static CudaGetDriverEntryPointByVersionFunc real_cuda_get_driver_entry_point_by_version_ = NULL;
+#endif
 
     cudaError_t call_real_cuda_malloc(void **ptr, size_t size) {
         if (C10_UNLIKELY(nullptr == real_cuda_malloc_)) {
@@ -57,4 +68,33 @@ namespace APIForwarder {
 
         return ret;
     }
+
+#if defined(USE_CUDA)
+    cudaError_t call_real_cuda_get_driver_entry_point(
+        const char* symbol,
+        void** func_ptr,
+        unsigned long long flags,
+        cudaDriverEntryPointQueryResult* status) {
+        if (C10_UNLIKELY(nullptr == real_cuda_get_driver_entry_point_)) {
+            real_cuda_get_driver_entry_point_ = (CudaGetDriverEntryPointFunc) check_dlsym(
+                dlsym(RTLD_NEXT, "cudaGetDriverEntryPoint"));
+        }
+        return real_cuda_get_driver_entry_point_(symbol, func_ptr, flags, status);
+    }
+
+    cudaError_t call_real_cuda_get_driver_entry_point_by_version(
+        const char* symbol,
+        void** func_ptr,
+        unsigned int version,
+        unsigned long long flags,
+        cudaDriverEntryPointQueryResult* status) {
+        if (C10_UNLIKELY(nullptr == real_cuda_get_driver_entry_point_by_version_)) {
+            real_cuda_get_driver_entry_point_by_version_ =
+                (CudaGetDriverEntryPointByVersionFunc) check_dlsym(
+                    dlsym(RTLD_NEXT, "cudaGetDriverEntryPointByVersion"));
+        }
+        return real_cuda_get_driver_entry_point_by_version_(
+            symbol, func_ptr, version, flags, status);
+    }
+#endif
 }

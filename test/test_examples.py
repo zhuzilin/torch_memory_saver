@@ -18,6 +18,7 @@ from examples import (
     multi_device_torch_mode,
     training_engine,
     nested_region,
+    expandable_segments,
 )
 
 _HOOK_MODES = ["preload", "torch"]
@@ -82,6 +83,19 @@ def test_nested_region():
         change_env("TMS_INIT_ENABLE_CPU_BACKUP", "1")
     ):
         _test_core(nested_region.run, hook_mode="preload")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None,
+    reason="expandable_segments requires a CUDA GPU",
+)
+def test_expandable_segments():
+    with (
+        change_env("TMS_INIT_ENABLE", "1"),
+        change_env("TMS_INIT_ENABLE_CPU_BACKUP", "1"),
+        change_env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+    ):
+        _test_core(expandable_segments.run, hook_mode="preload")
 
 
 def _test_core(fn, hook_mode):

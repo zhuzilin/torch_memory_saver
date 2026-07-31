@@ -81,6 +81,43 @@ The mode can be chosen by:
 torch_memory_saver.hook_mode = "torch"
 ```
 
+### Expandable Segments Implementation
+
+The CUDA `preload` hook supports PyTorch's native caching allocator with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The implementation keeps
+the caching allocator enabled and works at the CUDA VMM layer:
+
+* The preload library intercepts `cudaGetDriverEntryPoint` and
+  `cudaGetDriverEntryPointByVersion`, then replaces the VMM entry points
+  resolved by PyTorch (`cuMemCreate`, `cuMemMap`, `cuMemSetAccess`,
+  `cuMemUnmap`, `cuMemRelease`, and `cuMemExportToShareableHandle`).
+  Resolver calls from NCCL, DeepEP, and unrelated CUDA libraries continue to
+  receive the original driver functions.
+* PyTorch sees stable logical allocation handles. Torch Memory Saver keeps the
+  corresponding physical handles and mapping/access metadata internally.
+  `pause()` backs up data when requested, unmaps the original virtual ranges,
+  and releases their physical handles. `resume()` creates new physical
+  handles, maps them at the same virtual addresses, restores access
+  permissions, and copies the data back.
+* Adjacent expandable-segment pages share one contiguous pinned-host backup.
+  This preserves zero-copy `get_cpu_backup()` for tensors that span several
+  CUDA VMM allocation handles and avoids redundant backup allocations.
+* `disable()` does not create a `torch.cuda.MemPool` in either expandable or
+  legacy mode. Allocations use a dedicated untracked CUDA stream. In expandable
+  mode, only the disabled window creates ordinary cached segments; the
+  expandable setting is restored afterwards. A device synchronization and
+  `empty_cache()` release fully unused temporary segments without disabling
+  PyTorch's caching allocator. Live buffers created in the disabled window
+  remain valid after the context exits.
+
+Expandable segments require the `preload` hook. The `torch` hook still uses a
+custom MemPool for `region()` and therefore rejects this allocator mode.
+
+CUDA VMM remapping changes the underlying physical memory. Communication
+libraries that register PyTorch tensor addresses for RDMA or IPC must
+deregister those buffers before `pause()` and register them again after
+`resume()`.
+
 ### Example of RL with CUDA Graph
 
 Please refer to `rl_example.py` for details.
