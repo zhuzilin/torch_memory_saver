@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <unordered_map>
 #include <atomic>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -43,6 +45,27 @@ struct AllocationMetadata {
 #endif
 };
 
+#if defined(USE_CUDA)
+struct VMMAllocationMetadata {
+    size_t allocation_size;
+    CUmemAllocationProp prop;
+    unsigned long long create_flags;
+    CUmemGenericAllocationHandle physical_handle;
+    CUdeviceptr ptr;
+    size_t map_size;
+    size_t map_offset;
+    unsigned long long map_flags;
+    std::vector<CUmemAccessDesc> access_descs;
+    std::string tag;
+    AllocationState state;
+    bool enable_cpu_backup;
+    std::shared_ptr<uint8_t> cpu_backup;
+    size_t cpu_backup_offset;
+    bool enable_disk_backup;
+    DiskBackupSlot disk;
+};
+#endif
+
 class TorchMemorySaver {
 public:
     static TorchMemorySaver& instance();
@@ -55,6 +78,35 @@ public:
         bool enable_cpu_backup,
         bool enable_disk_backup);
     cudaError_t free(void *ptr);
+
+#if defined(USE_CUDA)
+    CUresult vmm_create(
+        CUmemGenericAllocationHandle* logical_handle,
+        size_t size,
+        const CUmemAllocationProp* prop,
+        unsigned long long flags,
+        const std::string& tag,
+        bool enable_cpu_backup,
+        bool enable_disk_backup);
+    CUresult vmm_map(
+        CUdeviceptr ptr,
+        size_t size,
+        size_t offset,
+        CUmemGenericAllocationHandle logical_handle,
+        unsigned long long flags);
+    CUresult vmm_set_access(
+        CUdeviceptr ptr,
+        size_t size,
+        const CUmemAccessDesc* desc,
+        size_t count);
+    CUresult vmm_unmap(CUdeviceptr ptr, size_t size);
+    CUresult vmm_release(CUmemGenericAllocationHandle logical_handle);
+    CUresult vmm_export_to_shareable_handle(
+        void* shareable_handle,
+        CUmemGenericAllocationHandle logical_handle,
+        CUmemAllocationHandleType handle_type,
+        unsigned long long flags);
+#endif
 
     void pause(const std::string& tag);
     void resume(const std::string& tag);
@@ -75,6 +127,11 @@ private:
 
     std::mutex allocator_metadata_mutex_;
     std::unordered_map<void*, AllocationMetadata> allocation_metadata_;
+#if defined(USE_CUDA)
+    std::unordered_map<CUmemGenericAllocationHandle, VMMAllocationMetadata> vmm_allocation_metadata_;
+    std::map<CUdeviceptr, CUmemGenericAllocationHandle> vmm_mapping_index_;
+    std::atomic<uint64_t> next_vmm_logical_handle_ = 1;
+#endif
     std::atomic<uint64_t> memory_margin_bytes_ = 0;
 
     // Guarded by allocator_metadata_mutex_.

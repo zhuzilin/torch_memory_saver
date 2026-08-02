@@ -1,6 +1,8 @@
 #include "utils.h"
 #include "core.h"
 #include "api_forwarder.h"
+#include <cstring>
+#include <dlfcn.h>
 #include <optional>
 #include "macro.h"
 
@@ -66,6 +68,128 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
 cudaError_t cudaFree(void *ptr) {
     return TorchMemorySaver::instance().free(ptr);
 }
+
+#if defined(USE_CUDA)
+extern "C" CUresult tms_cuMemCreate(
+    CUmemGenericAllocationHandle* handle,
+    size_t size,
+    const CUmemAllocationProp* prop,
+    unsigned long long flags) {
+    if (!thread_local_config.is_interesting_region()) {
+        return cuMemCreate(handle, size, prop, flags);
+    }
+    return TorchMemorySaver::instance().vmm_create(
+        handle,
+        size,
+        prop,
+        flags,
+        thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(),
+        thread_local_config.enable_disk_backup());
+}
+
+extern "C" CUresult tms_cuMemMap(
+    CUdeviceptr ptr,
+    size_t size,
+    size_t offset,
+    CUmemGenericAllocationHandle handle,
+    unsigned long long flags) {
+    return TorchMemorySaver::instance().vmm_map(ptr, size, offset, handle, flags);
+}
+
+extern "C" CUresult tms_cuMemSetAccess(
+    CUdeviceptr ptr,
+    size_t size,
+    const CUmemAccessDesc* desc,
+    size_t count) {
+    return TorchMemorySaver::instance().vmm_set_access(ptr, size, desc, count);
+}
+
+extern "C" CUresult tms_cuMemUnmap(CUdeviceptr ptr, size_t size) {
+    return TorchMemorySaver::instance().vmm_unmap(ptr, size);
+}
+
+extern "C" CUresult tms_cuMemRelease(CUmemGenericAllocationHandle handle) {
+    return TorchMemorySaver::instance().vmm_release(handle);
+}
+
+extern "C" CUresult tms_cuMemExportToShareableHandle(
+    void* shareable_handle,
+    CUmemGenericAllocationHandle handle,
+    CUmemAllocationHandleType handle_type,
+    unsigned long long flags) {
+    return TorchMemorySaver::instance().vmm_export_to_shareable_handle(
+        shareable_handle, handle, handle_type, flags);
+}
+
+static bool is_pytorch_driver_api_caller(void* return_address) {
+    Dl_info caller_info = {};
+    if (dladdr(return_address, &caller_info) == 0 || caller_info.dli_fname == nullptr) {
+        return false;
+    }
+    // Do not hand logical TMS handles to NCCL, DeepEP, or arbitrary CUDA
+    // libraries that happen to resolve the same driver APIs. PyTorch's
+    // DriverAPI singleton currently lives in libc10_cuda; keep libtorch_cuda
+    // for compatibility with versions that place the resolver there.
+    return std::strstr(caller_info.dli_fname, "libc10_cuda") != nullptr ||
+        std::strstr(caller_info.dli_fname, "libtorch_cuda") != nullptr;
+}
+
+static void maybe_hook_vmm_driver_entry_point(
+    const char* symbol,
+    void** func_ptr,
+    void* return_address) {
+    if (func_ptr == nullptr || *func_ptr == nullptr) {
+        return;
+    }
+    if (!is_pytorch_driver_api_caller(return_address)) {
+        return;
+    }
+    if (std::strcmp(symbol, "cuMemCreate") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemCreate);
+    } else if (std::strcmp(symbol, "cuMemMap") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemMap);
+    } else if (std::strcmp(symbol, "cuMemSetAccess") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemSetAccess);
+    } else if (std::strcmp(symbol, "cuMemUnmap") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemUnmap);
+    } else if (std::strcmp(symbol, "cuMemRelease") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemRelease);
+    } else if (std::strcmp(symbol, "cuMemExportToShareableHandle") == 0) {
+        *func_ptr = reinterpret_cast<void*>(&tms_cuMemExportToShareableHandle);
+    }
+}
+
+extern "C" cudaError_t cudaGetDriverEntryPoint(
+    const char* symbol,
+    void** func_ptr,
+    unsigned long long flags,
+    cudaDriverEntryPointQueryResult* status) {
+    const cudaError_t result = APIForwarder::call_real_cuda_get_driver_entry_point(
+        symbol, func_ptr, flags, status);
+    if (result == cudaSuccess) {
+        maybe_hook_vmm_driver_entry_point(
+            symbol, func_ptr, __builtin_return_address(0));
+    }
+    return result;
+}
+
+extern "C" cudaError_t cudaGetDriverEntryPointByVersion(
+    const char* symbol,
+    void** func_ptr,
+    unsigned int version,
+    unsigned long long flags,
+    cudaDriverEntryPointQueryResult* status) {
+    const cudaError_t result =
+        APIForwarder::call_real_cuda_get_driver_entry_point_by_version(
+            symbol, func_ptr, version, flags, status);
+    if (result == cudaSuccess) {
+        maybe_hook_vmm_driver_entry_point(
+            symbol, func_ptr, __builtin_return_address(0));
+    }
+    return result;
+}
+#endif
 #endif
 
 #ifdef TMS_HOOK_MODE_TORCH

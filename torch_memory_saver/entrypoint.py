@@ -4,6 +4,7 @@ import ctypes
 import numpy as np
 import logging
 import os
+import re
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Optional
@@ -116,7 +117,11 @@ class _TorchMemorySaverImpl:
         self._hook_util = HookUtilBase.create(hook_mode=hook_mode)
         self._binary_wrapper = BinaryWrapper(path_binary=self._hook_util.get_path_binary())
         self._mem_pools = defaultdict(lambda: torch.cuda.MemPool(allocator=self._hook_util.get_allocator()))
-        _sanity_checks()
+        current_device = torch.cuda.current_device()
+        self._untracked_streams = {
+            current_device: torch.cuda.Stream(device=current_device),
+        }
+        _sanity_checks(hook_mode)
         if torch.version.hip:
             # Unlike CUDA where cuMem* are Driver API calls, HIP puts everything in user-space libraries
             # whose C++ static destructors may run before MemPool's destructor during process exit ("static 
@@ -126,6 +131,18 @@ class _TorchMemorySaverImpl:
 
     @contextmanager
     def region(self, tag: str, enable_cpu_backup: bool, enable_disk_backup: bool):
+        if self._hook_mode == "preload" and _expandable_segments_enabled():
+            # PyTorch does not allow MemPool with expandable_segments. In
+            # preload mode the VMM hooks can manage the native expandable
+            # allocator directly, so only the TMS region configuration is
+            # needed here.
+            with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    enable_disk_backup=enable_disk_backup):
+                yield
+            return
+
         # See https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
         # Key by device too: a MemPool is bound to its creation device, so a
         # multi-device process must not reuse one device's pool on another.
@@ -175,12 +192,38 @@ class _TorchMemorySaverImpl:
 
         self._binary_wrapper.cdll.tms_set_interesting_region(False)
         try:
-            # We can either reuse the pool or delete it immediately, and we implement the latter currently since Slime uses it.
-            # About why we need a pool: https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
-            pool = torch.cuda.MemPool()
-            with torch.cuda.use_mem_pool(pool):
-                yield
-            del pool
+            device = torch.cuda.current_device()
+            untracked_stream = self._untracked_streams.get(device)
+            if untracked_stream is None:
+                untracked_stream = torch.cuda.Stream(device=device)
+                self._untracked_streams[device] = untracked_stream
+
+            allocator_conf = None
+            if self._hook_mode == "preload" and _expandable_segments_enabled():
+                # Existing paused expandable blocks are still present in the
+                # caching allocator's free lists. PyTorch explicitly skips
+                # those blocks while expandable_segments is false, giving the
+                # disabled section an isolated set of ordinary cudaMalloc
+                # cache segments without disabling the caching allocator.
+                allocator_conf = _allocator_conf()
+                torch.cuda.memory._set_allocator_settings(
+                    _replace_expandable_segments(allocator_conf, False))
+            try:
+                # The caching allocator keys reusable blocks by CUDA stream.
+                # A dedicated untracked stream therefore cannot reuse a block
+                # from a paused training segment, including on the legacy
+                # non-expandable path.
+                with torch.cuda.stream(untracked_stream):
+                    yield
+            finally:
+                try:
+                    # Release the untracked stream's ordinary cache before the
+                    # paused training allocations need their physical memory.
+                    torch.cuda.synchronize(device)
+                    torch.cuda.empty_cache()
+                finally:
+                    if allocator_conf is not None:
+                        torch.cuda.memory._set_allocator_settings(allocator_conf)
         finally:
             self._binary_wrapper.cdll.tms_set_interesting_region(True)
 
@@ -218,8 +261,32 @@ class _TorchMemorySaverImpl:
         assert ans.stride() == x.stride(), f"{ans.stride()=} {x.stride()=}"
         return ans
 
-def _sanity_checks():
-    if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+def _allocator_conf() -> str:
+    return os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        os.environ.get("PYTORCH_ALLOC_CONF", ""),
+    )
+
+
+def _expandable_segments_enabled() -> bool:
+    for item in _allocator_conf().split(","):
+        key, separator, value = item.partition(":")
+        if separator and key.strip().lower() == "expandable_segments":
+            return value.strip().lower() == "true"
+    return False
+
+
+def _replace_expandable_segments(conf: str, enabled: bool) -> str:
+    replacement = f"expandable_segments:{enabled}"
+    pattern = re.compile(r"(^|,)\s*expandable_segments\s*:\s*[^,]*", re.IGNORECASE)
+    if pattern.search(conf):
+        return pattern.sub(lambda match: f"{match.group(1)}{replacement}", conf)
+    return f"{conf},{replacement}" if conf else replacement
+
+
+def _sanity_checks(hook_mode: HookMode):
+    if hook_mode == "torch" and _expandable_segments_enabled():
         raise RuntimeError(
-            "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
+            "TorchMemorySaver hook_mode='torch' uses MemPool, which PyTorch does not support with "
+            "expandable_segments. Use the default hook_mode='preload' instead."
         )
