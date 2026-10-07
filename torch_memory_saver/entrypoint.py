@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import weakref
 
 import numpy as np
 import logging
@@ -119,7 +120,7 @@ class _TorchMemorySaverImpl:
         self._mem_pools = defaultdict(lambda: torch.cuda.MemPool(allocator=self._hook_util.get_allocator()))
         current_device = torch.cuda.current_device()
         self._untracked_streams = {
-            current_device: torch.cuda.Stream(device=current_device),
+            current_device: self._create_untracked_stream(current_device),
         }
         _sanity_checks(hook_mode)
         if torch.version.hip:
@@ -128,6 +129,26 @@ class _TorchMemorySaverImpl:
             # destruction order fiasco"). By clearing _mem_pools in an atexit handler, we ensure MemPool 
             # destruction (and thus HIP API calls) happens while the HIP/HSA runtime is still fully alive.
             atexit.register(self._mem_pools.clear)
+
+    def _create_untracked_stream(self, device):
+        # torch.cuda.Stream() comes from a shared pool: NCCL and other users
+        # can get the same stream and populate its cache with tracked blocks.
+        # Own a non-blocking stream so disable() never reuses those blocks.
+        prefix = "hip" if torch.version.hip else "cuda"
+        create = getattr(self._binary_wrapper.cdll, f"{prefix}StreamCreateWithFlags")
+        create.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        create.restype = ctypes.c_int
+        destroy = getattr(self._binary_wrapper.cdll, f"{prefix}StreamDestroy")
+        destroy.argtypes = [ctypes.c_void_p]
+        destroy.restype = ctypes.c_int
+        pointer = ctypes.c_void_p()
+        with torch.cuda.device(device):
+            error = create(ctypes.byref(pointer), 1)  # cuda/hipStreamNonBlocking
+            if error:
+                raise RuntimeError(f"{prefix}StreamCreateWithFlags failed: {error}")
+            stream = torch.cuda.ExternalStream(pointer.value, device=device)
+        weakref.finalize(stream, destroy, pointer)
+        return stream
 
     @contextmanager
     def region(self, tag: str, enable_cpu_backup: bool, enable_disk_backup: bool):
@@ -195,7 +216,7 @@ class _TorchMemorySaverImpl:
             device = torch.cuda.current_device()
             untracked_stream = self._untracked_streams.get(device)
             if untracked_stream is None:
-                untracked_stream = torch.cuda.Stream(device=device)
+                untracked_stream = self._create_untracked_stream(device)
                 self._untracked_streams[device] = untracked_stream
 
             allocator_conf = None
@@ -209,10 +230,9 @@ class _TorchMemorySaverImpl:
                 torch.cuda.memory._set_allocator_settings(
                     _replace_expandable_segments(allocator_conf, False))
             try:
-                # The caching allocator keys reusable blocks by CUDA stream.
-                # A dedicated untracked stream therefore cannot reuse a block
-                # from a paused training segment, including on the legacy
-                # non-expandable path.
+                # The stream is owned by TMS and is never handed out by
+                # PyTorch's stream pool. Its cache contains only untracked
+                # allocations, including on the non-expandable path.
                 with torch.cuda.stream(untracked_stream):
                     yield
             finally:

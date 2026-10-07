@@ -19,6 +19,7 @@ from examples import (
     training_engine,
     nested_region,
     expandable_segments,
+    disable_ipc,
 )
 
 _HOOK_MODES = ["preload", "torch"]
@@ -96,6 +97,18 @@ def test_expandable_segments():
         change_env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
     ):
         _test_core(expandable_segments.run, hook_mode="preload")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None,
+    reason="CUDA IPC requires a CUDA GPU",
+)
+def test_disable_ipc():
+    with (
+        change_env("TMS_INIT_ENABLE", "1"),
+        change_env("TMS_INIT_ENABLE_CPU_BACKUP", "1"),
+    ):
+        _test_core(disable_ipc.run, hook_mode="preload")
 
 
 def _test_core(fn, hook_mode):
