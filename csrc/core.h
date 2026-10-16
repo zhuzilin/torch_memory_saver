@@ -43,6 +43,7 @@ struct AllocationMetadata {
     size_t allocation_size;
     CUmemGenericAllocationHandle allocHandle;
 #endif
+    bool cpu_backup_registered = false;
 };
 
 #if defined(USE_CUDA)

@@ -2,6 +2,59 @@
 #include "utils.h"
 #include "macro.h"
 #include "api_forwarder.h"
+#include <cstdlib>
+#include <unistd.h>
+
+namespace {
+cudaError_t allocate_cpu_backup(void** ptr, size_t size, bool& registered) {
+    registered = false;
+    cudaError_t result = cudaMallocHost(ptr, size);
+#if defined(USE_CUDA)
+    if (size > 0 && (result == cudaErrorMemoryAllocation || result == cudaErrorInvalidValue)) {
+        // Retry through OS-backed storage, faulting its pages before asking
+        // CUDA to pin them. The resulting backup still supports zero-copy views.
+        std::cerr << "[torch_memory_saver.cpp] cudaMallocHost failed for " << size
+                  << " bytes: " << cudaGetErrorString(result)
+                  << "; retrying with registered host memory" << std::endl;
+        cudaGetLastError();
+        const long system_page_size = sysconf(_SC_PAGESIZE);
+        if (system_page_size <= 0) {
+            return result;
+        }
+        const size_t page_size = static_cast<size_t>(system_page_size);
+        void* allocation = nullptr;
+        if (posix_memalign(&allocation, page_size, size) != 0) {
+            return cudaErrorMemoryAllocation;
+        }
+        for (size_t offset = 0; offset < size; offset += page_size) {
+            static_cast<volatile char*>(allocation)[offset] = 0;
+        }
+        result = cudaHostRegister(allocation, size, cudaHostRegisterDefault);
+        if (result != cudaSuccess) {
+            std::free(allocation);
+            return result;
+        }
+        *ptr = allocation;
+        registered = true;
+    }
+#endif
+    return result;
+}
+
+cudaError_t free_cpu_backup(void* ptr, bool registered) {
+#if defined(USE_CUDA)
+    if (registered) {
+        const cudaError_t result = cudaHostUnregister(ptr);
+        if (result != cudaSuccess) {
+            return result;
+        }
+        std::free(ptr);
+        return cudaSuccess;
+    }
+#endif
+    return cudaFreeHost(ptr);
+}
+}  // namespace
 
 TorchMemorySaver::TorchMemorySaver()
     : disk_backend_(compute_disk_backup_dir_from_env(), compute_disk_chunk_bytes_from_env()) {}
@@ -107,7 +160,7 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
     CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.allocation_size));
 
     if (nullptr != metadata.cpu_backup) {
-        CUDA_ERROR_CHECK(cudaFreeHost(metadata.cpu_backup));
+        CUDA_ERROR_CHECK(free_cpu_backup(metadata.cpu_backup, metadata.cpu_backup_registered));
         metadata.cpu_backup = nullptr;
     }
 
@@ -349,7 +402,8 @@ void TorchMemorySaver::pause(const std::string& tag) {
 
         if (metadata.enable_cpu_backup) {
             if (nullptr == metadata.cpu_backup) {
-                CUDA_ERROR_CHECK(cudaMallocHost(&metadata.cpu_backup, metadata.raw_size));
+                CUDA_ERROR_CHECK(allocate_cpu_backup(
+                    &metadata.cpu_backup, metadata.raw_size, metadata.cpu_backup_registered));
             }
             SIMPLE_CHECK(metadata.cpu_backup != nullptr, "cpu_backup should not be nullptr");
             // TODO may use cudaMemcpyAsync if needed
@@ -411,14 +465,15 @@ void TorchMemorySaver::pause(const std::string& tag) {
         }
 
         void* raw_backup = nullptr;
-        CUDA_ERROR_CHECK(cudaMallocHost(&raw_backup, backup_size));
+        bool registered = false;
+        CUDA_ERROR_CHECK(allocate_cpu_backup(&raw_backup, backup_size, registered));
         auto backup = std::shared_ptr<uint8_t>(
             static_cast<uint8_t*>(raw_backup),
-            [](uint8_t* ptr) {
+            [registered](uint8_t* ptr) {
                 if (ptr != nullptr) {
-                    const cudaError_t result = cudaFreeHost(ptr);
+                    const cudaError_t result = free_cpu_backup(ptr, registered);
                     if (result != cudaSuccess) {
-                        std::cerr << "[torch_memory_saver.cpp] cudaFreeHost failed for VMM backup: "
+                        std::cerr << "[torch_memory_saver.cpp] Freeing VMM CPU backup failed: "
                                   << cudaGetErrorString(result) << std::endl;
                     }
                 }
@@ -504,7 +559,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
 
             // TODO may provide a flag to choose whether to free immediately
             // (users may want to lazily free to reduce re-alloc time)
-            CUDA_ERROR_CHECK(cudaFreeHost(metadata.cpu_backup));
+            CUDA_ERROR_CHECK(free_cpu_backup(metadata.cpu_backup, metadata.cpu_backup_registered));
             metadata.cpu_backup = nullptr;
         } else if (metadata.enable_disk_backup) {
             disk_backend_.onload(ptr, metadata.raw_size, metadata.disk);
