@@ -48,6 +48,7 @@ import torch
 from torch_memory_saver import torch_memory_saver as saver
 
 mode, allocation_error, registration_error = sys.argv[1:]
+pageable = int(registration_error) in (1, 2)
 saver.hook_mode = "torch" if mode == "torch" else "preload"
 saver.memory_margin_bytes = 0
 faults = ctypes.CDLL(None)
@@ -66,8 +67,9 @@ for cycle in range(3):
     faults.tms_test_set_faults(int(allocation_error), int(registration_error))
     saver.pause("backup")
     faults.tms_test_set_faults(0, 0)
-    assert faults.tms_test_registrations() > 0
+    assert (faults.tms_test_registrations() == 0) if pageable else (faults.tms_test_registrations() > 0)
     backup = saver.get_cpu_backup(tensor, zero_copy=True)
+    assert backup.is_pinned() != pageable
     assert torch.equal(backup, expected)
     del backup
     saver.resume("backup")
@@ -78,7 +80,7 @@ for cycle in range(3):
     expected.add_(1)
 
 # Freeing a paused allocation must unregister its backing storage as well.
-faults.tms_test_set_faults(int(allocation_error), 0)
+faults.tms_test_set_faults(int(allocation_error), int(registration_error))
 saver.pause("backup")
 faults.tms_test_set_faults(0, 0)
 del tensor
@@ -138,8 +140,17 @@ def test_cpu_backup_propagates_other_cuda_errors(allocation_faults):
     assert "illegal memory access" in result.stderr
 
 
-def test_cpu_backup_propagates_registration_failure(allocation_faults):
-    result = run_backup(allocation_faults, "preload", 1, registration_error=2)
+@pytest.mark.parametrize("mode", ["preload", "torch", "expandable"])
+@pytest.mark.parametrize("registration_error", [1, 2])
+def test_cpu_backup_uses_pageable_memory_when_pinning_fails(allocation_faults, mode, registration_error):
+    result = run_backup(allocation_faults, mode, 1, registration_error=registration_error)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "using pageable host memory" in result.stderr
+
+
+def test_cpu_backup_propagates_other_registration_errors(allocation_faults):
+    result = run_backup(allocation_faults, "preload", 1, registration_error=700)
     assert result.returncode != 0
     assert "retrying with registered host memory" in result.stderr
-    assert "out of memory" in result.stderr
+    assert "using pageable host memory" not in result.stderr
+    assert "illegal memory access" in result.stderr

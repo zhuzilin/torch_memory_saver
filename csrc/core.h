@@ -23,6 +23,8 @@ enum class AllocationState {
     PAUSED
 };
 
+enum class CPUBackupKind { CUDA_PINNED, REGISTERED, PAGEABLE };
+
 struct AllocationMetadata {
     size_t raw_size;
     CUdevice device;
@@ -43,7 +45,7 @@ struct AllocationMetadata {
     size_t allocation_size;
     CUmemGenericAllocationHandle allocHandle;
 #endif
-    bool cpu_backup_registered = false;
+    CPUBackupKind cpu_backup_kind = CPUBackupKind::CUDA_PINNED;
 };
 
 #if defined(USE_CUDA)
